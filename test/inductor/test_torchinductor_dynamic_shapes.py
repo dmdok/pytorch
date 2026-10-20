@@ -141,7 +141,8 @@ class DynamicShapesTestCase(TestCase):
 
 
 class DynamicShapesOpTests:
-    hw_classification = HardwareClassification.GENERIC
+    # Mixin only -- never collected itself (not a TestCase); concrete
+    # subclasses set their own hw_classification label.
 
     @torch._dynamo.config.patch(assume_static_by_default=False)
     def test_prod_backward_keeps_input_shape_dynamic(self):
@@ -212,18 +213,26 @@ if HAS_CPU:
     copy_tests(DynamicShapesCommonTemplate, DynamicShapesCpuTests, "cpu", test_failures)
 
 
-class DynamicShapesGPUTests(
-    DynamicShapesOpTests, DynamicShapesCommonTemplate, DynamicShapesTestCase
-):
-    hw_classification = HardwareClassification.ACCELERATOR
-    common = check_model_gpu
+# Restore the pre-migration gating from copy_tests: HAS_GPU requires a
+# working Triton installation (and sufficient compute capability), so when
+# it is false the GPU variants must not be generated at all -- otherwise
+# every test fails with "Cannot find a working triton installation" where
+# the whole class used to stay undefined. TEST_WITH_ASAN is excluded because
+# the generic class below is not device-aware (no DeviceTypeTestBase), so
+# under ASAN, where instantiate_device_type_tests never runs, pytest would
+# still collect it and every test would error in setUp.
+if (HAS_GPU or HAS_MPS) and not TEST_WITH_ASAN:
 
-    def setUp(self):
-        super().setUp()
-        self.device = self.device_type
+    class DynamicShapesGPUTests(
+        DynamicShapesOpTests, DynamicShapesCommonTemplate, DynamicShapesTestCase
+    ):
+        hw_classification = HardwareClassification.ACCELERATOR
+        common = check_model_gpu
 
+        def setUp(self):
+            super().setUp()
+            self.device = self.device_type
 
-if not TEST_WITH_ASAN:
     instantiate_device_type_tests(
         DynamicShapesGPUTests,
         globals(),
@@ -304,14 +313,17 @@ if not TEST_WITH_ASAN:
 class TestInductorDynamic(DynamicShapesTestCase):
     hw_classification = HardwareClassification.ACCELERATOR
 
-    # NOTE: this must be a regular method, not a `functools.partial` class
-    # attribute. Starting with Python 3.14, `functools.partial` implements
-    # the descriptor protocol, so `self.compile_fn(fn)` would bind `self`
-    # and call `torch.compile(self, fn, ...)` -> TypeError.
-    def compile_fn(self, fn, *args, **kwargs):
-        return torch.compile(fn, *args, dynamic=True, **kwargs)
+    # NB: the staticmethod wrapper matters here -- it shields the partial from
+    # the descriptor protocol, so `self.compile_fn(fn)` stays
+    # `torch.compile(fn, dynamic=True)` even on Python >= 3.14, where bare
+    # functools.partial instances bind `self` as method descriptors.
+    compile_fn = staticmethod(functools.partial(torch.compile, dynamic=True))
 
     def setUp(self):
+        # HAS_CUDA_AND_TRITON also checks compute capability to skip tests
+        # on older devices
+        if not HAS_GPU:
+            self.skipTest("Triton not available")
         torch._dynamo.reset()
         super().setUp()
         # this should be in setUpClass, but device-generic tests
@@ -769,14 +781,12 @@ class TestInductorDynamic(DynamicShapesTestCase):
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_unbacked_reduction(self, device):
         # Compiling data-dependent output sizes (`x.item()` feeding a shape)
-        # is not uniformly supported yet: depending on the environment it may
-        # either raise or succeed. On configurations where it has historically
-        # been expected to fail (plain CPU without cpp_wrapper, excluding
-        # ARM64), tolerate the failure instead of asserting an xfail, which
-        # produces spurious "expected to fail, but actually passed" errors on
-        # environments where compilation now succeeds. On all other
-        # configurations, require success.
-        tolerate_failure = (
+        # is expected to fail on plain CPU without cpp_wrapper (excluding
+        # ARM64); an unexpected pass there is a regression and must fail the
+        # test. On all other configurations, require success. (The setUp
+        # HAS_GPU guard already skips CPU-only runners entirely, where
+        # compilation may succeed for unrelated reasons.)
+        expect_fail = (
             device == "cpu" and not IS_ARM64 and not torch._inductor.config.cpp_wrapper
         )
         try:
@@ -789,8 +799,11 @@ class TestInductorDynamic(DynamicShapesTestCase):
             arg = torch.tensor(5, device=device)
             self.assertEqual(f(arg), cf(arg))
         except Exception:
-            if not tolerate_failure:
+            if not expect_fail:
                 raise
+        else:
+            if expect_fail:
+                self.fail("expected to fail, but actually passed")
 
     @torch._dynamo.config.patch(
         capture_scalar_outputs=True, capture_dynamic_output_shape_ops=True
@@ -1472,6 +1485,11 @@ class TestInductorDynamic(DynamicShapesTestCase):
             self.assertEqual(fn(x), actual)
             FileCheck().check("R0_BLOCK: tl.constexpr = 64").run(source_codes[0])
 
+    # The only Inductor-specific assertion here is a Triton-codegen FileCheck,
+    # which always passes on C++ codegen -- so running it on CPU spends a
+    # large compile without guarding anything.
+    @onlyAccelerator
+    @skipIf(not has_triton(), "Requires Triton")
     def test_non_persistent_dynamic_rblock(self, device):
         def reduce_bounded(x, y):
             """Reduce over a dimension with bounded size."""
