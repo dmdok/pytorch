@@ -1,12 +1,12 @@
 # Owner(s): ["module: inductor"]
 import contextlib
-import functools
 import importlib
 import math
 import operator
 import os
 import sys
 import unittest
+from functools import partial, wraps
 
 import torch
 import torch.library
@@ -26,7 +26,6 @@ from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests,
     onlyAccelerator,
     onlyCPU,
-    skipIf,
 )
 from torch.testing._internal.common_utils import (
     HardwareClassification,
@@ -38,15 +37,18 @@ from torch.testing._internal.common_utils import (
     skipIfRocm,
     skipIfRocmArch,
     TEST_CUDA_MEM_LEAK_CHECK,
+    TEST_PRIVATEUSE1,
     TEST_WITH_ASAN,
 )
 from torch.testing._internal.inductor_utils import (
     HAS_CPU,
+    HAS_CUDA_AND_TRITON,
     HAS_GPU,
     HAS_MPS,
+    HAS_MTIA_AND_TRITON,
+    HAS_XPU_AND_TRITON,
     patch_inductor_backend,
 )
-from torch.utils._triton import has_triton
 
 
 # Make the helper files in test/ importable
@@ -141,8 +143,8 @@ class DynamicShapesTestCase(TestCase):
 
 
 class DynamicShapesOpTests:
-    # Mixin only -- never collected itself (not a TestCase); concrete
-    # subclasses set their own hw_classification label.
+    # Mixin only: never collected (not a TestCase); subclasses set their own
+    # hw_classification label.
 
     @torch._dynamo.config.patch(assume_static_by_default=False)
     def test_prod_backward_keeps_input_shape_dynamic(self):
@@ -213,15 +215,25 @@ if HAS_CPU:
     copy_tests(DynamicShapesCommonTemplate, DynamicShapesCpuTests, "cpu", test_failures)
 
 
-# Restore the pre-migration gating from copy_tests: HAS_GPU requires a
-# working Triton installation (and sufficient compute capability), so when
-# it is false the GPU variants must not be generated at all -- otherwise
-# every test fails with "Cannot find a working triton installation" where
-# the whole class used to stay undefined. TEST_WITH_ASAN is excluded because
-# the generic class below is not device-aware (no DeviceTypeTestBase), so
-# under ASAN, where instantiate_device_type_tests never runs, pytest would
-# still collect it and every test would error in setUp.
-if (HAS_GPU or HAS_MPS) and not TEST_WITH_ASAN:
+# Per-device mapping of whether the inductor backend for the device needs
+# (and has) a working Triton installation. Devices absent from the map
+# (CPU, MPS, and out-of-tree privateuse1 accelerators) either do not use the
+# Triton codegen path or are expected to manage their own gating.
+_TRITON_OK = {
+    "cuda": HAS_CUDA_AND_TRITON,
+    "xpu": HAS_XPU_AND_TRITON,
+    "mtia": HAS_MTIA_AND_TRITON,
+}
+# TEST_PRIVATEUSE1 (imported above) is true whenever a privateuse1 backend is
+# registered, which also means instantiate_device_type_tests generates the
+# privateuse1 variant of every class; out-of-tree accelerators (e.g. NPU) are
+# expected to manage their own gating.
+
+# TEST_WITH_ASAN is excluded because the generic class below is not
+# device-aware (no DeviceTypeTestBase), so under ASAN, where
+# instantiate_device_type_tests never runs, pytest would still collect it
+# and every test would error in setUp.
+if not TEST_WITH_ASAN:
 
     class DynamicShapesGPUTests(
         DynamicShapesOpTests, DynamicShapesCommonTemplate, DynamicShapesTestCase
@@ -230,8 +242,38 @@ if (HAS_GPU or HAS_MPS) and not TEST_WITH_ASAN:
         common = check_model_gpu
 
         def setUp(self):
+            # Branch on the injected device's Triton support rather than
+            # aggregate process availability, so a machine with a working
+            # CUDA+Triton still runs the CPU-independent device variants it
+            # can, and devices without a working Triton installation skip
+            # instead of failing with "Cannot find a working triton
+            # installation".
+            if not _TRITON_OK.get(self.device_type, True):
+                self.skipTest("Inductor requires a working Triton installation")
             super().setUp()
             self.device = self.device_type
+
+    # instantiate_device_type_tests only processes the class's own __dict__,
+    # so copy the template test methods in before instantiation: tests left
+    # behind on the template base class would be exposed to the generated
+    # variant classes through inheritance only and bypass instantiate_test
+    # (no per-method test_exclusions, no _stop_test_suite handling). The
+    # template methods are deleted as they are copied so the variants expose
+    # exactly the instantiate_test-generated (suffixed) tests and nothing
+    # through MRO.
+    for _tname, _tval in list(vars(DynamicShapesCommonTemplate).items()):
+        if _tname.startswith("test") and callable(_tval):
+            # CommonTemplate is decorated with instantiate_parametrized_tests,
+            # so its already-expanded @parametrize tests still carry a
+            # parametrize_fn attribute (functools.wraps copies the wrapped
+            # function's __dict__). instantiate_test would re-parametrize
+            # them, calling with kwargs their expanded signature no longer
+            # accepts. The template method is deleted as it is copied, so
+            # stripping the attribute in place is safe.
+            _tval.__dict__.pop("parametrize_fn", None)
+            setattr(DynamicShapesGPUTests, _tname, _tval)
+            delattr(DynamicShapesCommonTemplate, _tname)
+    del _tname, _tval
 
     instantiate_device_type_tests(
         DynamicShapesGPUTests,
@@ -245,10 +287,12 @@ if (HAS_GPU or HAS_MPS) and not TEST_WITH_ASAN:
     # creating the GPU variant classes. instantiate_device_type_tests has
     # no equivalent mechanism, so re-attach the non-CPU xfail/skip markers
     # to the generated variant classes, matching the copy_tests semantics.
-    # NB: the template tests are exposed on the variant classes through MRO
-    # inheritance under their original (unsuffixed) names; wrapping a
-    # variant's attribute only affects that variant, not the shared template
-    # method used by the other device variants.
+    # NB: instantiate_test names the per-device copies `test_foo_<device>`
+    # and deletes the unsuffixed generic test methods afterwards (see
+    # instantiate_device_type_tests in common_device_type.py), so the
+    # markers must be attached to the suffixed names; wrapping a variant's
+    # suffixed attribute only affects that variant, not the other device
+    # variants.
     #
     # NB: the fixups below run inside a function on purpose. pytest collects
     # unittest.TestCase subclasses under *any* module-level name, so a loop
@@ -264,17 +308,17 @@ if (HAS_GPU or HAS_MPS) and not TEST_WITH_ASAN:
                     # CPU entries are still applied by copy_tests above.
                     continue
                 _variant_cls = globals().get(f"DynamicShapesGPUTests{_suffix.upper()}")
-                _test = getattr(_variant_cls, _name, None)
+                _test = getattr(_variant_cls, f"{_name}_{_suffix}", None)
                 if _test is None:
                     # Variant class not generated on this machine (e.g. no XPU).
                     continue
 
                 # unittest.expectedFailure mutates the test item in place on
-                # Python >= 3.12, which would mark the shared template method for
-                # every device variant. Bind the method into a per-variant copy
-                # first (same technique as copy_tests) so the marker only applies
-                # to this variant.
-                @functools.wraps(_test)
+                # Python >= 3.12. Each variant already holds its own
+                # instantiated_test copy, but keep the per-variant copy
+                # indirection (same technique as copy_tests) so the marker
+                # can never leak into an attribute shared across variants.
+                @wraps(_test)
                 def _copy(self, _test=_test):
                     return _test(self)
 
@@ -283,28 +327,37 @@ if (HAS_GPU or HAS_MPS) and not TEST_WITH_ASAN:
                     if _failure.is_skip
                     else unittest.expectedFailure
                 )
-                setattr(_variant_cls, _name, _marker(_copy))
+                setattr(_variant_cls, f"{_name}_{_suffix}", _marker(_copy))
 
         # gfx950 shows deterministic mismatches for these two generated tests
         # (conv_with_as_strided numerical mismatch, randint64 distribution for
-        # high bounds). The guards are applied per variant after instantiation:
-        # doing it before would put the guarded methods into the generic class's
+        # high bounds). The guards are applied per variant after instantiation,
+        # on the suffixed test name (see the NB above): doing it before
+        # instantiation would put the guarded methods into the generic class's
         # own __dict__, and instantiate_device_type_tests would then generate
-        # per-device suffixed copies on top of the unguarded MRO-exposed
-        # template methods (duplicated tests, unguarded copy reachable).
+        # suffixed copies on top of them (duplicated tests, unguarded copy
+        # reachable).
         for _name in list(globals().keys()):
             if not _name.startswith("DynamicShapesGPUTests"):
                 continue
             _cls = globals()[_name]
+            # Mirrors the suffix instantiate_test builds: privateuse1 uses the
+            # renamed backend name (e.g. "npu"), every other device its type.
+            _suffix = (
+                _cls.device_type
+                if _cls.device_type != "privateuse1"
+                else torch._C._get_privateuse1_backend_name()
+            )
             for _gfx_name in (
                 "test_conv_with_as_strided_dynamic_shapes",
                 "test_randint_distribution_dynamic_shapes",
             ):
-                if hasattr(_cls, _gfx_name):
+                _suffixed = f"{_gfx_name}_{_suffix}"
+                if hasattr(_cls, _suffixed):
                     setattr(
                         _cls,
-                        _gfx_name,
-                        skipIfRocmArch(MI350_ARCH)(getattr(_cls, _gfx_name)),
+                        _suffixed,
+                        skipIfRocmArch(MI350_ARCH)(getattr(_cls, _suffixed)),
                     )
 
     _reattach_markers_and_guards()
@@ -313,17 +366,16 @@ if (HAS_GPU or HAS_MPS) and not TEST_WITH_ASAN:
 class TestInductorDynamic(DynamicShapesTestCase):
     hw_classification = HardwareClassification.ACCELERATOR
 
-    # NB: the staticmethod wrapper matters here -- it shields the partial from
-    # the descriptor protocol, so `self.compile_fn(fn)` stays
-    # `torch.compile(fn, dynamic=True)` even on Python >= 3.14, where bare
-    # functools.partial instances bind `self` as method descriptors.
-    compile_fn = staticmethod(functools.partial(torch.compile, dynamic=True))
+    compile_fn = staticmethod(partial(torch.compile, dynamic=True))
 
     def setUp(self):
-        # HAS_CUDA_AND_TRITON also checks compute capability to skip tests
-        # on older devices
-        if not HAS_GPU:
-            self.skipTest("Triton not available")
+        # Keep the pre-PR semantics: on runners without a first-party GPU even
+        # the CPU variant skips; privateuse1 accelerators (e.g. NPU) manage
+        # their own gating but do not re-enable the CPU variant.
+        if not (HAS_GPU or (TEST_PRIVATEUSE1 and self.device_type != "cpu")):
+            self.skipTest("No accelerator device available")
+        if not _TRITON_OK.get(self.device_type, True):
+            self.skipTest("Inductor requires a working Triton installation")
         torch._dynamo.reset()
         super().setUp()
         # this should be in setUpClass, but device-generic tests
@@ -783,9 +835,7 @@ class TestInductorDynamic(DynamicShapesTestCase):
         # Compiling data-dependent output sizes (`x.item()` feeding a shape)
         # is expected to fail on plain CPU without cpp_wrapper (excluding
         # ARM64); an unexpected pass there is a regression and must fail the
-        # test. On all other configurations, require success. (The setUp
-        # HAS_GPU guard already skips CPU-only runners entirely, where
-        # compilation may succeed for unrelated reasons.)
+        # test. On all other configurations, require success.
         expect_fail = (
             device == "cpu" and not IS_ARM64 and not torch._inductor.config.cpp_wrapper
         )
@@ -869,6 +919,12 @@ class TestInductorDynamic(DynamicShapesTestCase):
     @onlyAccelerator
     @parametrize("avoid_guards", [False, True])
     def test_avoid_32bit_indexing_guards(self, device, avoid_guards):
+        # The Triton-codegen FileChecks below are only meaningful on the
+        # first-party inductor GPU backends; keep the pre-PR onlyOn(GPU_TYPE)
+        # semantics instead of running them on out-of-tree accelerators.
+        if self.device_type not in _TRITON_OK:
+            self.skipTest("Requires a first-party inductor Triton device")
+
         def fn(x):
             return x * 2 + 1
 
@@ -976,7 +1032,7 @@ class TestInductorDynamic(DynamicShapesTestCase):
 
         f(torch.tensor([3], device=device))
 
-    def test_meta_dynamic_shapes(self, device):
+    def test_meta_dynamic_shapes(self):
         def foobar(x, y):
             return x * 2, y * 3
 
@@ -986,7 +1042,7 @@ class TestInductorDynamic(DynamicShapesTestCase):
 
         self.assertEqual(foo_c(t, y), foobar(t, y))
 
-    def test_floor(self, device):
+    def test_floor(self):
         def fn(x):
             n = x.size(-1)
             y = x + int(n * 0.2) + 1
@@ -1277,7 +1333,7 @@ class TestInductorDynamic(DynamicShapesTestCase):
         self.assertEqual(output, expected)
 
     @serialTest()
-    def test_wrapper_codegen_statically_known_int_or_none(self, device):
+    def test_wrapper_codegen_statically_known_int_or_none(self):
         torch._dynamo.reset()
 
         _x = torch.randn([5, 3, 3])
@@ -1381,7 +1437,7 @@ class TestInductorDynamic(DynamicShapesTestCase):
         f(x)
 
     @torch._dynamo.config.patch(specialize_float=False, capture_scalar_outputs=True)
-    def test_unspecialized_float_operations(self, device):
+    def test_unspecialized_float_operations(self):
         operations = {
             "multiply": operator.mul,
             "add": operator.add,
@@ -1411,7 +1467,7 @@ class TestInductorDynamic(DynamicShapesTestCase):
                     self.assertEqual(cnt.frame_count, 1)
 
     @torch._dynamo.config.patch(specialize_float=False)
-    def test_unspecialized_float_fallback_specialization(self, device):
+    def test_unspecialized_float_fallback_specialization(self):
         def fn(x, y, z):
             return (
                 torch.tensor(z),
@@ -1436,7 +1492,7 @@ class TestInductorDynamic(DynamicShapesTestCase):
         self.assertEqual(cnt.frame_count, 2)
 
     @torch._dynamo.config.patch(specialize_float=False)
-    def test_unspecialized_float_softshrink(self, device):
+    def test_unspecialized_float_softshrink(self):
         # This test is particularly interesting since it exercises
         # both standard operator replacements ie. torch.ops.aten.mul.Tensor
         # as well as comparison replacements ie. torch.ops.aten.ge.Scalar
@@ -1455,8 +1511,12 @@ class TestInductorDynamic(DynamicShapesTestCase):
         self.assertEqual(cnt.frame_count, 2)
 
     @onlyAccelerator
-    @skipIf(not has_triton(), "Requires Triton")
     def test_dynamic_rblock_bounds(self, device):
+        # Triton-codegen FileCheck below is only meaningful on the first-party
+        # inductor GPU backends; keep the pre-PR onlyOn(GPU_TYPE) semantics.
+        if self.device_type not in _TRITON_OK:
+            self.skipTest("Requires a first-party inductor Triton device")
+
         class ForcePersistent(InductorChoices):
             @staticmethod
             def should_use_cooperative_reduction(*args, **kwargs) -> bool:
@@ -1489,8 +1549,13 @@ class TestInductorDynamic(DynamicShapesTestCase):
     # which always passes on C++ codegen -- so running it on CPU spends a
     # large compile without guarding anything.
     @onlyAccelerator
-    @skipIf(not has_triton(), "Requires Triton")
     def test_non_persistent_dynamic_rblock(self, device):
+        # Same as test_dynamic_rblock_bounds: Triton-codegen FileCheck below
+        # is only meaningful on the first-party inductor GPU backends; keep
+        # the pre-PR onlyOn(GPU_TYPE) semantics.
+        if self.device_type not in _TRITON_OK:
+            self.skipTest("Requires a first-party inductor Triton device")
+
         def reduce_bounded(x, y):
             """Reduce over a dimension with bounded size."""
             # x shape: [batch, features, reduction_dim]
@@ -1521,7 +1586,7 @@ class TestInductorDynamic(DynamicShapesTestCase):
         if not torch.allclose(result, expected, atol=1e-3, rtol=1e-3):
             raise AssertionError
 
-    def test_unspecialized_float_dynamic(self, device):
+    def test_unspecialized_float_dynamic(self):
         def fn(x, y):
             return x * y
 
@@ -1535,7 +1600,7 @@ class TestInductorDynamic(DynamicShapesTestCase):
         self.assertEqual(cnt.frame_count, 1)
 
     @torch._dynamo.config.patch(specialize_float=False)
-    def test_unspecialized_float_fallback_symint_specialization(self, device):
+    def test_unspecialized_float_fallback_symint_specialization(self):
         def fn(x, y):
             return math.floor(x**2) * y
 
@@ -1551,7 +1616,16 @@ class TestInductorDynamic(DynamicShapesTestCase):
 
     @skipIfRocm(msg="sort kernel exceeds the inductor compile-worker timeout")
     def test_sort_dynamic_shape_with_check(self, device):
-        if device == "cpu":
+        # Exact kernel-count assertions only hold for the first-party inductor
+        # GPU backends with a working Triton installation. The zero-count
+        # check below keeps the pre-PR CPU behavior (extern-kernel
+        # decomposition emits no inductor kernels); out-of-tree devices are
+        # expected to decompose the same way but have not been validated.
+        # NB: self.device_type, not the injected device argument -- the
+        # framework passes the primary device as "cuda:0"-style string
+        # (common_device_type.py get_primary_device), which never matches
+        # the _TRITON_OK keys.
+        if self.device_type not in _TRITON_OK:
 
             def check_count(n):
                 self.assertEqual(metrics.generated_kernel_count, 0)
@@ -1668,7 +1742,7 @@ class TestInductorDynamic(DynamicShapesTestCase):
         out_compiled.sum().backward()
 
     @torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True)
-    def test_combinations_dynamic(self, device):
+    def test_combinations_dynamic(self):
         def f(x):
             return torch.combinations(x, r=2)
 
