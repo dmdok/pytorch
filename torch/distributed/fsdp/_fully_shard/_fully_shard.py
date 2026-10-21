@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import functools
+import weakref
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, cast, Literal, NoReturn, overload, TYPE_CHECKING
@@ -13,6 +14,11 @@ import torch
 import torch.nn as nn
 from torch.distributed._composable import contract
 
+from ._all_gather_layout import (
+    AllGatherLayout,
+    DEFAULT_ALL_GATHER_LAYOUT,
+    DefaultAllGatherLayout,
+)
 from ._fsdp_api import (
     AllGather,
     DataParallelMeshDims,
@@ -20,7 +26,7 @@ from ._fsdp_api import (
     OffloadPolicy,
     ReduceScatter,
 )
-from ._fsdp_collectives import _default_reduce_scatter_input_fn
+from ._fsdp_collectives import _default_reduce_scatter_input_fn, DefaultAllGather
 from ._fsdp_common import _dynamo_disable, FSDPMeshInfo, ShardPlacementFnResult
 from ._fsdp_init import (
     _apply_to_module,
@@ -771,6 +777,14 @@ class FSDPModule:
         to have better control over the communication and memory usage.
         See `Comm` and `ReduceScatter` for details.
 
+        This sets only the comm and keeps the installed all-gather layout. A
+        layout that requires a specific comm is installed with it by
+        :meth:`set_all_gather_layout`; while such a layout is installed, any
+        other comm is rejected, and its comm must not be installed on another
+        parameter group. With a custom layout installed, replacing the comm is
+        also rejected while an all-gather is pending, while parameters are
+        unsharded, or after they adopt output storage from the layout.
+
         Args:
             comm (AllGather): Custom all-gather communication.
         """
@@ -782,6 +796,16 @@ class FSDPModule:
                 "The custom comm would be ambiguous across groups with different meshes."
             )
         for fsdp_param_group in state._fsdp_param_groups:
+            layout = fsdp_param_group._all_gather_layout
+            if layout.comm is not None and comm is not layout.comm:
+                raise RuntimeError(
+                    "cannot install a different all-gather comm while the "
+                    "installed layout is bound to its comm"
+                )
+            # The default layout's outputs do not depend on the comm
+            replaced = comm is not fsdp_param_group._all_gather_comm
+            if replaced and not isinstance(layout, DefaultAllGatherLayout):
+                fsdp_param_group._check_all_gather_replaceable()
             fsdp_param_group._all_gather_comm = comm
 
     def set_custom_reduce_scatter(self, comm: ReduceScatter) -> None:
@@ -891,6 +915,79 @@ class FSDPModule:
         state = self._get_fsdp_state()
         for fsdp_param_group in state._fsdp_param_groups:
             fsdp_param_group.force_sum_reduction_for_comms = enable
+
+    def set_all_gather_layout(
+        self, layout: AllGatherLayout | None, /, *, recurse: bool = True
+    ) -> None:
+        r"""Set the layout that packs and finalizes a parameter group's all-gather.
+
+        .. warning::
+            This API is experimental. The layout contract and supported FSDP
+            internals may change without backward compatibility.
+
+        The layout packs the group's all-gather inputs before the collective and
+        turns the collective output into the parameters' all-gather outputs
+        after it completes.
+        :class:`~torch.distributed.fsdp.experimental.DefaultAllGatherLayout`
+        packs rank-major input and copies the output with its ``output_fn``,
+        e.g. ``DefaultAllGatherLayout(all_gather_output_fn_with_native_copy)``
+        for the native copy; it works with any comm that produces rank-major
+        output. This is the only way to install a layout. A layout whose
+        ``comm`` is set, e.g. one whose collective writes parameter-contiguous
+        output, requires that collective: installing the layout installs its
+        comm too, and the parameter group then rejects any other comm, including
+        from :meth:`set_custom_all_gather`, until another layout is installed,
+        which restores the default comm unless it has its own comm, so re-apply
+        that setter, :meth:`set_symm_mem_for_comm` or
+        :meth:`set_allocate_memory_from_process_group_for_comm` afterwards. Such
+        a layout serves one parameter group; install a separate instance on each
+        module with ``recurse=False``. Set layouts and those comms before the
+        first unshard: once parameters adopt outputs from a custom layout, neither
+        can be replaced. FSDP checks every group before changing any.
+
+        Args:
+            layout (Optional[AllGatherLayout]): Layout, or ``None`` to restore
+                the default layout and, if the replaced layout installed its
+                comm, the default comm.
+            recurse (bool): Whether to also set the layout for all nested FSDP
+                modules. Defaults to ``True``.
+        """
+        layout = DEFAULT_ALL_GATHER_LAYOUT if layout is None else layout
+        if not isinstance(layout, AllGatherLayout):
+            raise TypeError(
+                f"expected an AllGatherLayout, e.g. DefaultAllGatherLayout(fn), but "
+                f"got {layout!r}"
+            )
+        self_module = cast(nn.Module, self)
+        modules = list(self_module.modules()) if recurse else [self_module]
+        updates = []
+        for module in modules:
+            if not isinstance(module, FSDPModule):
+                continue
+            for fsdp_param_group in module._get_fsdp_state()._fsdp_param_groups:
+                comm = layout.comm or fsdp_param_group._all_gather_comm
+                if layout.comm is None and fsdp_param_group._all_gather_layout.comm:
+                    comm = DefaultAllGather()  # the replaced layout installed its comm
+                if layout is not fsdp_param_group._all_gather_layout:
+                    fsdp_param_group._check_all_gather_replaceable()
+                updates.append((fsdp_param_group, comm))
+        if layout.comm is not None:
+            # Its comm may read per-call state that the layout keeps for one group
+            groups: set[FSDPParamGroup | None] = {group for group, _ in updates}
+            if layout._fsdp_param_group is not None:
+                groups.add(layout._fsdp_param_group())
+            if len(groups - {None}) > 1:
+                raise ValueError(
+                    "A layout bound to its comm serves one parameter group; install "
+                    "a separate instance on each module with recurse=False"
+                )
+        for fsdp_param_group, comm in updates:
+            if (old_layout := fsdp_param_group._all_gather_layout).comm is not None:
+                old_layout._fsdp_param_group = None
+            if layout.comm is not None:
+                layout._fsdp_param_group = weakref.ref(fsdp_param_group)
+            fsdp_param_group._all_gather_layout = layout
+            fsdp_param_group._all_gather_comm = comm
 
     def set_reduce_scatter_input_fn(
         self, fn: Callable | None, /, *, recurse: bool = True
@@ -1071,7 +1168,8 @@ class FSDPModule:
         This cannot be used together with :meth:`set_custom_all_gather` or
         :meth:`set_custom_reduce_scatter` as those APIs allow for
         finer-grained control over each communication, and this method cannot
-        determine their staging buffer allocation strategy.
+        determine their staging buffer allocation strategy. It is also rejected
+        while an all-gather layout bound to its comm is installed.
 
         Args:
             enable (bool): Whether to turn on ProcessGroup allocation.
@@ -1104,7 +1202,8 @@ class FSDPModule:
         Collectives](https://docs.pytorch.org/docs/2.11/symmetric_memory.html#copy-engine-collectives).
 
         This cannot be used together with :meth:`set_custom_all_gather` or
-        :meth:`set_custom_reduce_scatter`.
+        :meth:`set_custom_reduce_scatter`, and is rejected while an all-gather
+        layout bound to its comm is installed.
 
         Args:
             backend (str): The symmetric memory backend to use. Defaults to
