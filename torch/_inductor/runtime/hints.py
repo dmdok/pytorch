@@ -11,6 +11,8 @@ from torch.utils._triton import has_triton_package
 
 
 # The following maximums only apply to runtime autotuning, when using FixedTritonConfig one may see larger values
+# A capped kernel's XBLOCK may exceed TRITON_MAX_BLOCK["X"] (see InductorMeta's
+# grid_max_xblock).
 # NOTE: if these fail asserts submit a PR to increase them
 TRITON_MAX_BLOCK = {
     "X": 8192 if torch.version.hip else 4096,
@@ -20,6 +22,28 @@ TRITON_MAX_BLOCK = {
     "R1_": 2048 * 16,  # * 16 is multi-kernel only
     "R2_": 2048 * 16,  # * 16 is multi-kernel only
 }
+# The default limit on a capped pointwise kernel's candidate XBLOCKs (InductorMeta's
+# grid_max_xblock): the largest XBLOCK of the default candidates
+# (PointwiseHeuristic.capped_grid_candidates), so the limit removes none of them
+CAPPED_GRID_DEFAULT_MAX_XBLOCK = 32768
+
+
+def is_valid_grid_cap(value: object) -> bool:
+    """Whether value can cap a launch grid: an int of at least 1, not a bool."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def is_valid_grid_max_xblock(value: object) -> bool:
+    """Whether value can limit a capped kernel's XBLOCK: an int power of 2, not a
+    bool."""
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 1
+        and value & (value - 1) == 0
+    )
+
+
 TRITON_MAX_MIX_ORDER_XBLOCK = 16
 TRITON_MAX_RSPLIT = 64
 TRITON_MAX_TENSOR_NUMEL = 1 << 20
@@ -378,6 +402,14 @@ class InductorMeta(typing.TypedDict, total=False):
     strict_reduction_rblock: int
     kernel_num_gb: float
     kernel_flop: int
+    # Capped launch grid (grid_type CappedGrid1D): grid_cap, at least 1, is the most
+    # programs it launches; grid_max_xblock, a power of 2 (default
+    # CAPPED_GRID_DEFAULT_MAX_XBLOCK), limits the default pointwise candidates' XBLOCK
+    # before any raise for min_elem_per_thread, and with TRITON_MAX_BLOCK["X"] sets
+    # the max block that every capped config's XBLOCK divides
+    # (check_capped_grid_config).
+    grid_cap: int
+    grid_max_xblock: int
 
     # Kernel identity / launch (codegen_kernel literal)
     grid_type: str
