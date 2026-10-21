@@ -469,7 +469,7 @@ class DistMatrixOpsTest(DTensorContinuousTestBase):
         and not PLATFORM_SUPPORTS_FP8,
         "FP8 reduction is only supported on H100+ and MI300+ devices",
     )
-    @unittest.skipIf(not SM90OrLater, "requires sm90+")
+    @unittest.skipUnless(SM90OrLater, "NCCL FP8 reduction support begins with sm90 capable devices")
     def test_scaled_mm(self):
         device_mesh = self.build_device_mesh()
         shrd0 = Shard(0)
