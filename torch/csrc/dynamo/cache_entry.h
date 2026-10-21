@@ -7,6 +7,7 @@
 #include <torch/csrc/dynamo/utils.h>
 #include <torch/csrc/utils/pybind.h>
 #include <list>
+#include <vector>
 
 extern "C" {
 
@@ -50,6 +51,8 @@ typedef struct VISIBILITY_HIDDEN CacheEntry {
   py::object compile_id;
   // root guard manager if exists
   void* root_mgr{nullptr};
+  // owner of diff_guard_root_mgr; reassigned by update_diff_guard_root_manager
+  py::object diff_guard_root;
   // diff guard root guard manager if exists
   void* diff_guard_root_mgr{nullptr};
   // backend used to create this cache entry
@@ -72,7 +75,13 @@ typedef struct VISIBILITY_HIDDEN CacheEntry {
   CacheEntry& operator=(CacheEntry&&) = default;
   ~CacheEntry();
 
-  void invalidate(py::object deleted_guard_manager);
+  // Leaves this entry matching nothing.  Dropping the references it held can
+  // run Python, so they are moved into released, old guard manager first, for
+  // the caller to drop outside the critical section.  The caller also clears
+  // that guard manager's back-references.
+  void invalidate(
+      py::object deleted_guard_manager,
+      std::vector<py::object>& released);
   // Called from the python side to update the diff guard root manager
   void update_diff_guard_root_manager();
   // A copy that owns its references and does not belong to the cache.  The
